@@ -4,7 +4,7 @@
 #   .venv/bin/python bridge/xt_bridge.py --channel xt_... [--port /dev/cu.usbserial-210] [--name husky]
 #
 # Device -> channel: BROADCAST -> message, DIRECT_MSG -> DM, HEARTBEAT -> status.
-# Channel -> device: messages and DMs as [from_len][from][text], cut to fit a 128-byte frame.
+# Channel -> device: messages and DMs as [from_len][from][text], cut to fit the device's frames.
 # Local agents (like the sim, which shares this serial port) can talk to the device directly
 # with send_local(); the device's DMs to them land in local_inbox instead of going to the hub.
 import argparse
@@ -45,6 +45,7 @@ class DeviceBridge:
         self.local_names = set(local_names)
         self.local_inbox = queue.Queue()
         self.log = log
+        self.name = name
         self.status = ""
         self.ct = None
         if channel:
@@ -67,8 +68,8 @@ class DeviceBridge:
 
     def _to_device(self, kind, message):
         sender = message.get("from", {})
-        if sender.get("id") == self.me:
-            return
+        if sender.get("id") == self.me or sender.get("name") == self.name:
+            return  # our own posts, or another copy of this robot: never feed robots each other's chatter
         content = message.get("content", "")
         self._write(frame(OP_DIRECT_MSG if kind == "dm" else OP_BROADCAST, attributed(sender.get("name", "?"), content)))
         self.log("-> device %s %s: %s" % (kind, sender.get("name"), content[:80]))

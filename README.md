@@ -1,61 +1,84 @@
-# ESP32 robot brain
+# ESP32 robot brain over Cross Talk
 
-An ESP32 (MicroPython) runs a tiny neural net that drives a simulated rover and shows
-an animated face on a 128x64 OLED (GME12864-43, SSD1306, I2C 0x3c, SDA=GPIO21, SCL=GPIO22).
-The sim runs on the Mac and talks to the brain over USB serial, directly or through a
-[Cross Talk](https://github.com/ajokhai/cross-talk) hub.
+Plain-English instructions for a robot, with the decisions made on an ESP32:
+
+> @husky turn around, investigate that blue square, then go back to where you started
+
+The robot posts its skill menu and what it sees in a [Cross Talk](https://github.com/ajokhai/cross-talk)
+channel; people and agents instruct it with `@husky ...`.
 
 ```
-sim/sim.py ──"s <seq> d1..d5"──▶ ESP32 brain (esp32/main.py) ──▶ policy net (shared/policy.py)
-           ◀──"m <seq> L R"────                                └─▶ face on the OLED (esp32/face.py)
+you / agents ──"@husky ..."──▶ #robot-lab (Cross Talk hub)
+                                  │ bridge (USB serial)
+ESP32 brain (esp32/main.py) ◀─────┘
+ ├─ exact calls ("approach blue box; return")  run as they are
+ ├─ plain English → on-chip command model      shared/nlu.py (word vectors, ~400 KB flash)
+ ├─ not sure → DM @pilot                       a small LLM; must answer with exact calls
+ ├─ memory                                     where it started; every object it has seen
+ ├─ skills                                     go turn goto approach find return look explore ...
+ └─ face on the OLED                           GME12864-43 (SSD1306, I2C 0x3c, SDA=21, SCL=22)
+        ▲ ranges, pose, camera sightings / wheel commands, 10 Hz
+MuJoCo sim (sim/mj_sim.py): Clearpath Husky URDF, coloured boxes and cylinders, a camera
 ```
+
+The Mac only runs the world (physics, camera) and, for now, stands in for the onboard
+computer that hosts the pilot (the tablet later).
+
+## Start
+
+```sh
+./start.sh                                        # model server + channel + pilot; prints the channel
+.venv/bin/mjpython sim/mj_sim.py --channel xt_... # robot + 3D view
+crosstalk up xt_...                               # talk to it
+```
+
+Things to say:
+
+| You say | It runs |
+|---|---|
+| what can you see? | `look`: lists objects in view, with distance and direction |
+| turn around | `turn 180` |
+| investigate that blue square | `approach blue box`: drives up to it, faces it, describes it |
+| go back to where you started | `return` |
+| find the red pillar | `find red cylinder`: spins until it sees one |
+| check it out | `approach it` (the last object it found or visited) |
+| where are you? | `status` |
+| drive in a square with 1 m sides | asks the pilot, runs its plan |
+
+## Files
 
 | Path | What it is |
 | :-- | :-- |
-| `shared/policy.py` | The net: 5 range sensors -> 6 hidden -> 2 wheel speeds, 50 weights. Same file runs on the Mac and the ESP32. |
-| `sim/world.py` | 2D differential-drive rover, walled arena, round obstacles, 5 range sensors. |
-| `sim/train.py` | Evolves the weights in the headless sim and writes `esp32/weights.json` (~15 s). |
-| `sim/sim.py` | Runs the sim at 10 Hz against a brain; live view at http://localhost:8765. |
-| `sim/links.py` | How the sim reaches the brain: `serial`, `crosstalk` or `local`. |
-| `esp32/` | What runs on the board: brain (`main.py`), face, Cross Talk micro client, weights. |
-| `deploy.py` | Uploads `esp32/` + `shared/policy.py` to the board and restarts it. |
+| `esp32/main.py` | The brain: instructions, memory, object resolution, skills, steering, face. |
+| `shared/husky_menu.py` | The robot's self-description: skills, and the words its camera uses for things. |
+| `shared/nlu.py` | On-chip command model: matches instructions to any skill menu by meaning. |
+| `shared/policy.py` | Reflex net (5 ranges -> 2 wheels, 50 weights), used by `explore`. |
+| `tools/build_nlu.py` | Builds the word vectors and scores the command model (UGV, arm and USV menus). |
+| `sim/mj_world.py` | Any wheeled URDF in MuJoCo: wheels found automatically, range sensors, camera, objects. |
+| `sim/mj_sim.py` | Runs the world, hosts the bridge, asks the brain for wheel commands at 10 Hz. |
+| `bridge/xt_bridge.py` | Python stand-in for `crosstalk-bridge` (serial <-> hub). |
+| `deploy.py` | Uploads the brain (stops the running one first; skips unchanged files). |
+| `start.sh`, `pilot_prompt.txt` | Model server, channel and pilot. |
+| `sim/world.py`, `sim/train.py` | 2D sim used to train the reflex net. |
 
-## Setup
+Also in the repo: `bench/` (serial and hub round-trip benchmarks, measured on an earlier
+firmware) and the original 2D rover sim (`sim/sim.py`, `sim/links.py`, `sim/viewer.html`),
+which speaks an older sensor format than the current brain accepts.
 
-```sh
-python3 -m venv .venv && .venv/bin/pip install pyserial mpremote esptool websocket-client
-```
+## Known issues
 
-## Run
+- An instruction that starts with a skill name and continues ("find the red pillar, then
+  check it out") is taken as one exact call, so the part after "then" is dropped.
+- "drive in a square ..." is read as `approach square` ("square" is a word for a box).
+- The 1.5B pilot sometimes echoes the robot's reply format; the robot then refuses its plan.
+- `explore` still uses the reflex net trained in the 2D sim, which gets stuck on the Husky.
 
-```sh
-.venv/bin/python deploy.py                          # after changing anything in esp32/ or shared/
-.venv/bin/python sim/sim.py --link serial           # ESP32 over USB, no hub
-.venv/bin/python sim/sim.py --link local            # same net on the Mac, for comparison
-.venv/bin/python sim/train.py                       # retrain, then deploy
-```
+## Notes
 
-### Through Cross Talk
-
-The hub needs to allow 10 messages a second per agent, so run it without rate limits
-(it only listens on localhost): `crosstalk serve --no-rate-limit`. Then:
-
-```sh
-.venv/bin/python sim/sim.py --link crosstalk        # creates a channel and prints xt_...
-crosstalk-bridge --channel xt_... --serial /dev/cu.usbserial-210 --name esp32-brain
-```
-
-`crosstalk-bridge` comes from `packages/embedded` in the Cross Talk repo; it is not in the
-published `cross-talk` package.
-
-## Board notes
-
-- While the brain runs, bytes from the Mac are data, so Ctrl-C does nothing. `deploy.py`
-  sends the brain `!repl` first. Pressing the BOOT button also stops it.
-- `esp32/demo_animations.py` is the earlier starfield / bounce / Game of Life demo.
-
-## Benchmarks
-
-`bench/` holds the tests behind the Cross Talk benchmark write-up; raw results are in
-`bench/results/`. On 2026-10-25 the brain answered 600/600 steps over direct serial
-(median round trip 48.9 ms) and 883/900 through a Cross Talk hub (median 51.9 ms, p99 87.5 ms).
+- How it steers: towards the target, pushed away from whatever the range sensors see; if
+  those cancel out for a second it commits to going round on the roomier side.
+- Understanding an instruction takes ~0.5-1.5 s on the chip; the robot holds still meanwhile.
+- The brain ignores Ctrl-C while running; `deploy.py` DMs it `!repl` first, or press BOOT.
+- Sim and brain share one serial port, so only one of `mj_sim.py`, `xt_bridge.py`, `deploy.py` at a time.
+- Safety: `go` over 10 m and `goto` over 20 m are refused; pilot plans run only as exact calls.
+- Keep this folder out of iCloud-synced locations: evicted files make everything hang.

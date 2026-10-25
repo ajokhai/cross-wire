@@ -1,4 +1,5 @@
-# 2D differential-drive rover in a walled arena with round obstacles.
+# 2D differential-drive rover in a walled arena with round obstacles. Used to train the
+# reflex net (sim/train.py); the full robot runs in MuJoCo (sim/mj_world.py).
 import math
 import random
 
@@ -32,16 +33,13 @@ class World:
                 break
         self.x, self.y = x, y
         self.heading = self.rng.uniform(-math.pi, math.pi)
-        self.left = self.right = 0.0
         self.collisions = 0
         self.distance = 0.0
         self.visited = set()
-        self.trail = []
 
     def _ray(self, angle):
         dx, dy = math.cos(angle), math.sin(angle)
         best = SENSOR_RANGE
-        # walls
         if dx > 1e-9:
             best = min(best, (ARENA_W - self.x) / dx)
         elif dx < -1e-9:
@@ -50,12 +48,10 @@ class World:
             best = min(best, (ARENA_H - self.y) / dy)
         elif dy < -1e-9:
             best = min(best, -self.y / dy)
-        # circles
         for ox, oy, r in self.obstacles:
             fx, fy = self.x - ox, self.y - oy
             b = fx * dx + fy * dy
-            c = fx * fx + fy * fy - r * r
-            disc = b * b - c
+            disc = b * b - (fx * fx + fy * fy - r * r)
             if disc >= 0:
                 t = -b - math.sqrt(disc)
                 if 0 <= t < best:
@@ -69,9 +65,7 @@ class World:
 
     def step(self, left, right):
         """Wheel commands in -1..1. Returns True if the robot bumped something."""
-        self.left = max(-1.0, min(1.0, left))
-        self.right = max(-1.0, min(1.0, right))
-        vl, vr = self.left * MAX_SPEED, self.right * MAX_SPEED
+        vl, vr = max(-1.0, min(1.0, left)) * MAX_SPEED, max(-1.0, min(1.0, right)) * MAX_SPEED
         v = (vl + vr) / 2
         self.heading += (vr - vl) / WHEEL_BASE * DT
         self.heading = (self.heading + math.pi) % (2 * math.pi) - math.pi
@@ -79,27 +73,11 @@ class World:
         ny = self.y + v * math.sin(self.heading) * DT
         bumped = not (ROBOT_R <= nx <= ARENA_W - ROBOT_R and ROBOT_R <= ny <= ARENA_H - ROBOT_R)
         if not bumped:
-            for ox, oy, r in self.obstacles:
-                if math.hypot(nx - ox, ny - oy) < r + ROBOT_R:
-                    bumped = True
-                    break
+            bumped = any(math.hypot(nx - ox, ny - oy) < r + ROBOT_R for ox, oy, r in self.obstacles)
         if bumped:
             self.collisions += 1
         else:
             self.distance += abs(v) * DT
             self.x, self.y = nx, ny
         self.visited.add((int(self.x / CELL), int(self.y / CELL)))
-        self.trail.append((round(self.x, 2), round(self.y, 2)))
-        del self.trail[:-300]
         return bumped
-
-    def state(self):
-        return {
-            "arena": [ARENA_W, ARENA_H], "robot_r": ROBOT_R,
-            "x": self.x, "y": self.y, "heading": self.heading,
-            "left": self.left, "right": self.right,
-            "sensor_angles": SENSOR_ANGLES, "sensor_range": SENSOR_RANGE,
-            "obstacles": self.obstacles, "trail": self.trail,
-            "collisions": self.collisions, "distance": round(self.distance, 1),
-            "coverage": len(self.visited),
-        }

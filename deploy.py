@@ -1,6 +1,7 @@
 # Upload the brain to the ESP32 and restart it.
 #   .venv/bin/python deploy.py [--port /dev/cu.usbserial-210]
 # The running brain ignores Ctrl-C, so this first DMs it "!repl" to hand the REPL back.
+# mpremote skips files that are already up to date, so only changed files are sent.
 import argparse
 import os
 import struct
@@ -18,9 +19,10 @@ FILES = {
     "esp32/weights.json": "weights.json",
     "esp32/nlu_hash.bin": "nlu_hash.bin",
     "esp32/nlu_rank.bin": "nlu_rank.bin",
-    "esp32/nlu_vec.bin": "nlu_vec.bin",   # ~390 KB: about 3 minutes the first time, skipped when unchanged
+    "esp32/nlu_vec.bin": "nlu_vec.bin",   # ~400 KB: about 3 minutes when it changes
     "shared/policy.py": "policy.py",
     "shared/nlu.py": "nlu.py",
+    "shared/husky_menu.py": "husky_menu.py",
 }
 
 
@@ -38,9 +40,10 @@ def main():
     args = ap.parse_args()
 
     stop_brain(args.port)
+    # Run mpremote through this Python: script #! lines break on paths with spaces.
     mpremote = os.path.join(os.path.dirname(sys.executable), "mpremote")
     # "resume" skips mpremote's soft reset, which would start the brain again before the copy
-    cmd = [mpremote, "connect", args.port, "resume"]
+    cmd = [sys.executable, mpremote, "connect", args.port, "resume"]
     for src, dst in FILES.items():
         cmd += ["cp", os.path.join(HERE, src), ":" + dst, "+"]
     cmd += ["reset"]

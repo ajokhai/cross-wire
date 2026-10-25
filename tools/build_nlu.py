@@ -1,7 +1,7 @@
 # Distil word vectors for the on-device command model (shared/nlu.py) and score it on
-# skill menus for three different robots. Writes esp32/nlu_hash.bin + esp32/nlu_vec.bin.
+# skill menus for three different robots. Writes esp32/nlu_hash.bin, nlu_vec.bin, nlu_rank.bin.
 #
-#   .venv/bin/python tools/build_nlu.py [--model minishlab/potion-base-8M] [--dim 32] [--words 6000] [--eval-only]
+#   .venv/bin/python tools/build_nlu.py [--model minishlab/potion-base-8M] [--dim 64] [--words 6000] [--eval-only]
 import argparse
 import os
 import struct
@@ -12,19 +12,11 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..")
 sys.path.insert(0, os.path.join(ROOT, "shared"))
+from husky_menu import MENU as HUSKY, OBJECT_WORDS  # noqa: E402
 from nlu import Embeddings, Understander, fnv1a  # noqa: E402
 
 MENUS = {
-    "husky": [
-        "go(m) drive forward, or back up in reverse, a distance in meters",
-        "turn(deg) turn, spin or rotate in place by an angle, left is positive",
-        "goto(x,y) go to, navigate or head to a position x y on the map",
-        "explore(s) wander, roam and explore by itself while avoiding obstacles",
-        "stop() stop moving, halt, freeze",
-        "face(mood:happy|alert|scared|sleepy) show an emotion on its face",
-        "say(text) show a message on its screen",
-        "status() report where it is, its position and what it is doing",
-    ],
+    "husky": HUSKY,
     "arm": [
         "reach(x,y,z) move the hand to a point",
         "grip() close the gripper claw to grab or pick up an object",
@@ -46,13 +38,19 @@ TESTS = [
     ("husky", "drive forward two meters", "go"), ("husky", "move ahead 3 m", "go"),
     ("husky", "back up a bit", "go"), ("husky", "reverse 50 cm", "go"),
     ("husky", "spin around", "turn"), ("husky", "rotate 45 degrees to the right", "turn"),
-    ("husky", "turn left", "turn"), ("husky", "head over to 3, 4", "goto"),
+    ("husky", "turn left", "turn"), ("husky", "turn around", "turn"), ("husky", "head over to 3, 4", "goto"),
     ("husky", "navigate to x 2 y -1", "goto"), ("husky", "go explore for a minute", "explore"),
     ("husky", "roam around the room", "explore"), ("husky", "wander", "explore"),
     ("husky", "halt!", "stop"), ("husky", "freeze", "stop"), ("husky", "stop right there", "stop"),
     ("husky", "look happy", "face"), ("husky", "act scared", "face"), ("husky", "be sleepy", "face"),
     ("husky", "say hello world", "say"), ("husky", "display hi josh", "say"),
     ("husky", "where are you", "status"), ("husky", "report your position", "status"),
+    ("husky", "investigate that blue square", "approach"), ("husky", "check out the red pillar", "approach"),
+    ("husky", "drive up to the orange barrel", "approach"), ("husky", "inspect the green box", "approach"),
+    ("husky", "find the green cube", "find"), ("husky", "search for something yellow", "find"),
+    ("husky", "look for the blue box", "find"),
+    ("husky", "go back to where you started", "return"), ("husky", "return to the start", "return"),
+    ("husky", "what can you see", "look"), ("husky", "describe what's around you", "look"),
     ("arm", "grab the cube", "grip"), ("arm", "pick it up", "grip"), ("arm", "close the claw", "grip"),
     ("arm", "let go", "release"), ("arm", "drop it", "release"), ("arm", "open the hand", "release"),
     ("arm", "go back to rest", "home"), ("arm", "wave hello", "wave"),
@@ -61,10 +59,13 @@ TESTS = [
     ("usv", "drop anchor", "anchor"), ("usv", "hold position here", "anchor"),
     ("usv", "patrol the harbor", "patrol"), ("usv", "kill the engines", "stop"),
 ]
+# None = don't check that argument (object descriptions are resolved by the robot)
 MULTI = [
     ("husky", "drive forward two meters then turn right", [("go", [2.0]), ("turn", [-90])]),
     ("husky", "back up 1 m and spin around", [("go", [-1.0]), ("turn", [180])]),
     ("husky", "go to 3, 4 then look happy", [("goto", [3.0, 4.0]), ("face", ["happy"])]),
+    ("husky", "turn around, investigate that blue square, then go back to where you started",
+     [("turn", [180]), ("approach", [None]), ("return", [])]),
 ]
 
 
@@ -99,31 +100,42 @@ def build(model_name, dim, n_words, out_dir):
     return len(words)
 
 
+def same(got, want):
+    if len(got) != len(want):
+        return False
+    for (gn, ga), (wn, wa) in zip(got, want):
+        if gn != wn or len(ga) != len(wa):
+            return False
+        for g, w in zip(ga, wa):
+            if w is not None and (round(g, 2) if isinstance(g, float) else g) != w:
+                return False
+    return True
+
+
 def evaluate(out_dir, dim, verbose):
     emb = Embeddings(os.path.join(out_dir, "nlu_hash.bin"), os.path.join(out_dir, "nlu_vec.bin"),
                      os.path.join(out_dir, "nlu_rank.bin"), dim)
-    bots = {name: Understander(emb, menu) for name, menu in MENUS.items()}
+    bots = {name: Understander(emb, menu, object_words=OBJECT_WORDS if name == "husky" else ()) for name, menu in MENUS.items()}
     right = 0
     for bot, text, want in TESTS:
         call, score = bots[bot].clause(text)
         ok = call and call[0] == want
         right += bool(ok)
         if verbose or not ok:
-            print("  %s %-6s %-40s -> %-24s %.2f" % ("ok " if ok else "BAD", bot, text, call, score))
+            print("  %s %-6s %-40s -> %-30s %.2f" % ("ok " if ok else "BAD", bot, text, call, score))
     multi_ok = 0
     for bot, text, want in MULTI:
         calls, conf = bots[bot].parse(text)
-        got = [(n, [round(a, 2) if isinstance(a, float) else a for a in args]) for n, args in calls or []]
-        ok = got == [(n, [float(a) if isinstance(a, (int, float)) else a for a in args]) for n, args in want]
+        ok = same(calls or [], want)
         multi_ok += ok
-        print("  %s multi %-45s -> %s (%.2f)" % ("ok " if ok else "BAD", text, got, conf))
+        print("  %s multi %s\n        -> %s (%.2f)" % ("ok " if ok else "BAD", text, calls, conf))
     print("single: %d/%d   multi-step: %d/%d" % (right, len(TESTS), multi_ok, len(MULTI)))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="minishlab/potion-base-8M")
-    ap.add_argument("--dim", type=int, default=32)
+    ap.add_argument("--dim", type=int, default=64)
     ap.add_argument("--words", type=int, default=6000)
     ap.add_argument("--out", default=os.path.join(ROOT, "esp32"))
     ap.add_argument("--eval-only", action="store_true")
@@ -131,7 +143,7 @@ def main():
     args = ap.parse_args()
     if not args.eval_only:
         n = build(args.model, args.dim, args.words, args.out)
-        size = os.path.getsize(os.path.join(args.out, "nlu_vec.bin")) + os.path.getsize(os.path.join(args.out, "nlu_hash.bin"))
+        size = sum(os.path.getsize(os.path.join(args.out, f)) for f in ("nlu_vec.bin", "nlu_hash.bin", "nlu_rank.bin"))
         print("%s dim=%d: %d words, %d KB on flash" % (args.model, args.dim, n, size // 1024))
     evaluate(args.out, args.dim, args.verbose)
 

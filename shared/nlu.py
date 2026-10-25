@@ -16,8 +16,14 @@ try:
 except ImportError:  # pragma: no cover
     array = None
 
+try:
+    import micropython  # @micropython.native compiles hot loops to machine code on the ESP32
+except ImportError:
+    class micropython:  # CPython: the decorator does nothing
+        native = staticmethod(lambda f: f)
+
 STOP = set("the a an to of please can you could would will robot then and now just for me it is be at on in by "
-           "with your some bit are i am do does over".split())
+           "with your some bit are i am do does over that this there those these".split())
 UNITS_M = {"m": 1, "meter": 1, "meters": 1, "metre": 1, "metres": 1, "cm": 0.01, "centimeters": 0.01,
            "centimetres": 0.01, "ft": 0.3048, "feet": 0.3048, "foot": 0.3048, "mm": 0.001}
 NUMBERS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
@@ -56,6 +62,14 @@ def number(tok):
         return float(tok)
     except ValueError:
         return None
+
+
+@micropython.native
+def cosine(a, b):
+    s = 0.0
+    for i in range(len(a)):
+        s += a[i] * b[i]
+    return s
 
 
 class Embeddings:
@@ -127,9 +141,10 @@ class Embeddings:
         norm = math.sqrt(sum(x * x for x in acc)) or 1.0
         return array("f", [x / norm for x in acc])
 
-
-def cosine(a, b):
-    return sum(x * y for x, y in zip(a, b))
+    def similarity(self, a, b):
+        """Meaning similarity of two single words, -1..1 (0 if either is unknown)."""
+        va, vb = self.word(a), self.word(b)
+        return cosine(va[0], vb[0]) if va and vb else 0.0
 
 
 class Skill:
@@ -148,7 +163,7 @@ class Skill:
             desc_words += opts or []
         self.vec = emb.phrase(desc_words)
         self.word_vecs = [v for v, _ in emb.words(desc_words)]
-        self.n_numbers = sum(1 for kind, opts in self.params if not opts and kind not in ("text",))
+        self.n_numbers = sum(1 for kind, opts in self.params if not opts and kind not in ("text", "object"))
         self.option_vecs = {}
         for kind, opts in self.params:
             for o in opts or ():
@@ -156,9 +171,12 @@ class Skill:
 
 
 class Understander:
-    def __init__(self, emb, menu_lines, threshold=0.5):
+    def __init__(self, emb, menu_lines, threshold=0.5, object_words=()):
+        """object_words: words the robot uses for things it can see ("blue", "box", "pillar").
+        They pick the object argument rather than the skill."""
         self.emb = emb
         self.threshold = threshold
+        self.object_words = set(object_words)
         self.skills = [Skill(l, emb) for l in menu_lines]
 
     def _args(self, skill, words, raw):
@@ -190,6 +208,9 @@ class Understander:
                     if s > best_s:
                         best, best_s = o, s
                 out.append(best)
+            elif kind == "object":  # the robot resolves this against what it has seen
+                obj = [w for w in words if w in self.object_words or w.startswith("#")]
+                out.append(" ".join(obj) if obj else "it")
             elif kind == "text":
                 low = raw.lower()
                 for verb in ("say ", "display ", "show ", "write ", "print "):
@@ -223,16 +244,20 @@ class Understander:
 
     def clause(self, text):
         words = tokens(text)
-        vec = self.emb.phrase(words)
+        intent = [w for w in words if w not in self.object_words]  # what to do, minus which thing
+        mentions_object = len(intent) < len(words)
+        vec = self.emb.phrase(intent)
         if vec is None:
             return None, 0.0
-        found = self.emb.words(words)
+        found = self.emb.words(intent)
         n_numbers = sum(1 for w in words if number(w) is not None)
         best, best_s = None, -1.0
         for sk in self.skills:
             if sk.vec is None or not sk.word_vecs:
                 continue
             s = self.score(sk, vec, found, n_numbers)
+            if mentions_object:  # "the blue box" points at skills that take an object
+                s += 0.1 if any(kind == "object" for kind, _ in sk.params) else -0.1
             if s > best_s:
                 best, best_s = sk, s
         return (best.name, self._args(best, words, text)), best_s
@@ -240,8 +265,15 @@ class Understander:
     def parse(self, text):
         """Returns (calls, confidence). calls is None when the robot should ask for help."""
         parts = [text]
-        for sep in SPLIT:
+        for sep in SPLIT + (", ",):
             parts = [q for p in parts for q in p.split(sep)]
+        merged = []  # "go to 3, 4": a piece starting with a number belongs to the one before
+        for p in parts:
+            if merged and p.split() and number(p.split()[0]) is not None:
+                merged[-1] += " " + p
+            else:
+                merged.append(p)
+        parts = merged
         calls, worst = [], 1.0
         for p in parts:
             if not p.strip():

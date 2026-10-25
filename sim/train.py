@@ -1,4 +1,4 @@
-# Evolve the policy weights in the headless sim, then write esp32/weights.json.
+# Evolve the reflex net's weights in the 2D sim, then write esp32/weights.json.
 # Simple (mu, lambda) evolution strategy; no numpy needed.
 import json
 import os
@@ -29,8 +29,7 @@ def fitness(w, seeds):
     for seed in seeds:
         world = World(seed=seed)
         for _ in range(STEPS):
-            left, right = act(w, quantize(world.sensors()))
-            world.step(left, right)
+            world.step(*act(w, quantize(world.sensors())))
         # reward exploring new ground, punish bumping
         total += world.distance + 0.5 * len(world.visited) - 2.0 * world.collisions
     return total / len(seeds)
@@ -49,15 +48,14 @@ def main():
         if scored[0][0] > best_f:
             best_f, best_w = scored[0]
         sigma = max(0.05, sigma * 0.95)
-        print("gen %2d  best %.1f  mean-top %.1f" % (gen, scored[0][0], sum(f for f, _ in scored[:PARENTS]) / PARENTS), flush=True)
+        print("gen %2d  best %.1f" % (gen, scored[0][0]), flush=True)
 
-    # score the winner on fresh arenas it never trained on
     test = [World(seed=s) for s in (11, 22, 33, 44, 55)]
     for world in test:
         for _ in range(STEPS):
             world.step(*act(best_w, quantize(world.sensors())))
-    print("held-out: distance %.1f m, collisions %d, cells %d (avg over 5)" % (
-        sum(w.distance for w in test) / 5, sum(w.collisions for w in test) / 5, sum(len(w.visited) for w in test) / 5))
+    print("held-out: distance %.1f m, collisions %d (avg over 5)" % (
+        sum(w.distance for w in test) / 5, sum(w.collisions for w in test) / 5))
 
     out = os.path.join(HERE, "..", "esp32", "weights.json")
     with open(out, "w") as f:

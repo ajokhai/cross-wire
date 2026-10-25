@@ -4,7 +4,7 @@
 #
 #   .venv/bin/mjpython sim/mj_sim.py --channel xt_...            # with the 3D viewer
 #   .venv/bin/python   sim/mj_sim.py --channel xt_... --headless
-#   .venv/bin/python   sim/mj_sim.py --headless --say "go 2; turn 90" --seconds 20   # no hub
+#   .venv/bin/python   sim/mj_sim.py --headless --say "turn around" --seconds 20   # no hub
 import argparse
 import math
 import os
@@ -22,6 +22,7 @@ from xt_bridge import DeviceBridge  # noqa: E402
 
 SIM = "robot-sim"
 REPLY_TIMEOUT = 0.25
+RESEND_OBJECT_S = 1.0   # re-report an object in view this often, so the brain knows it's still visible
 
 
 def main():
@@ -32,7 +33,9 @@ def main():
     ap.add_argument("--name", default="husky", help="the robot's agent name (must match the brain)")
     ap.add_argument("--url", default=os.environ.get("CROSSTALK_URL", "ws://localhost:4488"))
     ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--say", action="append", default=[], help="instruction to give the robot at start (repeatable)")
+    ap.add_argument("--say", action="append", default=[], help="instruction to give the robot (repeatable; "
+                    "each one is sent after the previous has had --say-gap seconds)")
+    ap.add_argument("--say-gap", type=float, default=15)
     ap.add_argument("--seconds", type=float, default=0, help="stop after this much sim time (0 = forever)")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
@@ -40,16 +43,22 @@ def main():
     world = RobotWorld(args.urdf, seed=args.seed)
     bridge = DeviceBridge(args.port, args.channel, args.name, args.url, local_names={SIM})
     bridge.send_local("bridge", "@%s skills" % args.name, dm=False)
-    for text in args.say:
-        bridge.send_local("tester", "@%s %s" % (args.name, text), dm=False)
-    print("robot: %s, wheels %s" % (os.path.basename(args.urdf), [n for n, _ in world.wheels]), flush=True)
+    print("robot: %s, wheels %s, %d objects" % (os.path.basename(args.urdf), [n for n, _ in world.wheels],
+                                                len(world.objects)), flush=True)
 
     # Flow control: one sensor message in flight at a time. While the brain is busy (it
     # pauses to understand an instruction), new readings would overflow its ~256-byte
     # serial buffer, so the sim waits for the answer, or 2 s, before sending another.
+    # Camera sightings go out one per tick, only right after the brain has answered.
     stats = {"answered": 0, "missed": 0, "seq": 0, "waiting": None, "sent": 0.0}
+    reported = {}  # object id -> sim time last sent
+    says = list(args.say)
 
     def tick():
+        if says and world.time >= 2 + (len(args.say) - len(says)) * args.say_gap:
+            text = says.pop(0)
+            print("you: @%s %s" % (args.name, text), flush=True)
+            bridge.send_local("tester", "@%s %s" % (args.name, text), dm=False)
         if stats["waiting"] is None or time.monotonic() - stats["sent"] > 2.0:
             x, y, h = world.pose()
             ranges = [int(round(r * 100)) for r in world.ranges()]
@@ -74,7 +83,13 @@ def main():
             stats["answered"] += 1
             stats["waiting"] = None
             world.step(*command)
-        if stats["seq"] % 50 == 0:
+            due = [o for o in world.visible() if world.time - reported.get(o["id"], -99) >= RESEND_OBJECT_S]
+            if due:
+                o = min(due, key=lambda o: reported.get(o["id"], -99))
+                reported[o["id"]] = world.time
+                bridge.send_local(SIM, "o %d %s %s %d %d %d" % (o["id"], o["color"], o["shape"], round(o["x"] * 100),
+                                                               round(o["y"] * 100), round(o["r"] * 100)))
+        if stats["seq"] % 50 == 0 and command is not None:
             x, y, h = world.pose()
             print("t=%5.1fs  pose %.2f, %.2f, %4.0f deg  answered %d missed %d  bumps %d  [%s]" % (
                 world.time, x, y, math.degrees(h), stats["answered"], stats["missed"], world.bumps, bridge.status),
@@ -92,7 +107,7 @@ def main():
     with mujoco.viewer.launch_passive(world.model, world.data) as viewer:
         viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
         viewer.cam.trackbodyid = world.base_id
-        viewer.cam.distance, viewer.cam.elevation = 6.0, -35
+        viewer.cam.distance, viewer.cam.elevation = 7.0, -40
         next_tick = time.monotonic()
         while viewer.is_running() and not done():
             tick()

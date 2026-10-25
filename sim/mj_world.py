@@ -1,18 +1,25 @@
 # MuJoCo world for any wheeled URDF robot: loads the URDF, finds its wheels from the
-# joint layout, adds velocity motors, five range sensors and odometry, and builds an
-# arena with obstacles. The ESP32 brain only ever sees ranges, pose and wheel commands.
+# joint layout, adds velocity motors, five range sensors, odometry and a camera that
+# reports coloured objects in view, and builds an arena. The ESP32 brain only ever sees
+# ranges, pose, detections and sends wheel commands.
 import math
 import os
 import random
 import re
 
 import mujoco
+import numpy as np
 
-SENSOR_ANGLES = (-60, -30, 0, 30, 60)   # degrees, + = left (same as the 2D sim)
+SENSOR_ANGLES = (-60, -30, 0, 30, 60)   # degrees, + = left
 SENSOR_RANGE = 1.5                      # metres; readings are sent as 0..100 of this
+CAMERA_FOV = 60                         # degrees either side of straight ahead
+CAMERA_RANGE = 6.0                      # metres
 ARENA = 10.0                            # square arena, metres
 PHYSICS_DT = 0.002
 CONTROL_DT = 0.1                        # the brain is asked 10 times a second
+
+COLORS = {"red": (0.85, 0.2, 0.2), "blue": (0.2, 0.4, 0.95), "green": (0.2, 0.7, 0.3),
+          "yellow": (0.95, 0.85, 0.2), "orange": (0.95, 0.55, 0.15), "purple": (0.6, 0.3, 0.8)}
 
 
 def load_urdf(path):
@@ -29,14 +36,14 @@ def load_urdf(path):
 
 
 class RobotWorld:
-    def __init__(self, urdf, seed=7, n_obstacles=10, max_speed=1.0):
+    def __init__(self, urdf, seed=7, n_objects=10, max_speed=1.0):
         self.rng = random.Random(seed)
         self.max_speed = max_speed
         robot = load_urdf(urdf)
         spec = mujoco.MjSpec()
         spec.option.timestep = PHYSICS_DT
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-        self._scene(spec)
+        self._scene(spec, n_objects)
 
         # Attach the robot on a free joint so it can drive around.
         base = robot.worldbody.first_body()
@@ -74,15 +81,17 @@ class RobotWorld:
         self.motor_ids = [self.model.actuator(n + "/motor").id for n, _ in self.wheels]
         self.sides = [s for _, s in self.wheels]
         self.base_id = self.model.body(self.root.name).id
+        for o in self.objects:
+            o["geom"] = self.model.geom(o["geom_name"]).id
         mujoco.mj_forward(self.model, self.data)
         self.time = 0.0
         self.trail = []
         self.bumps = 0
 
-    def _scene(self, spec):
+    def _scene(self, spec, n_objects):
         spec.worldbody.add_light(pos=[0, 0, 6], dir=[0, 0, -1], diffuse=[0.8, 0.8, 0.8])
-        tex = spec.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
-                               rgb1=[0.25, 0.27, 0.3], rgb2=[0.3, 0.32, 0.35], width=512, height=512)
+        spec.add_texture(name="grid", type=mujoco.mjtTexture.mjTEXTURE_2D, builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
+                         rgb1=[0.25, 0.27, 0.3], rgb2=[0.3, 0.32, 0.35], width=512, height=512)
         spec.add_material(name="grid", textures=["", "grid"], texrepeat=[10, 10])
         spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_PLANE, size=[ARENA, ARENA, 0.1], material="grid",
                                 friction=[1.0, 0.01, 0.001])
@@ -90,19 +99,28 @@ class RobotWorld:
         for x, y, sx, sy in ((0, h, h, 0.1), (0, -h, h, 0.1), (h, 0, 0.1, h), (-h, 0, 0.1, h)):
             spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, pos=[x, y, 0.4], size=[sx, sy, 0.4],
                                     rgba=[0.55, 0.55, 0.6, 1])
-        self.obstacles = []
-        while len(self.obstacles) < 10:
+        # Coloured objects. The first is always a blue box, so "the blue box" exists.
+        self.objects = []
+        names = list(COLORS)
+        while len(self.objects) < n_objects:
             x, y = self.rng.uniform(-h + 1, h - 1), self.rng.uniform(-h + 1, h - 1)
-            r = self.rng.uniform(0.25, 0.6)
-            if math.hypot(x, y) < 1.8 or any(math.hypot(x - ox, y - oy) < r + orr + 1.2 for ox, oy, orr in self.obstacles):
+            r = self.rng.uniform(0.25, 0.5)
+            if math.hypot(x, y) < 2.0 or any(math.hypot(x - o["x"], y - o["y"]) < r + o["r"] + 1.2 for o in self.objects):
                 continue
-            self.obstacles.append((x, y, r))
-            if self.rng.random() < 0.5:
-                spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_CYLINDER, pos=[x, y, 0.4], size=[r, 0.4, 0],
-                                        rgba=[0.85, 0.5, 0.2, 1])
+            first = not self.objects
+            color = "blue" if first else self.rng.choice(names)
+            shape = "box" if first else self.rng.choice(("box", "cylinder"))
+            i = len(self.objects) + 1
+            geom_name = "obj%d" % i
+            rgba = list(COLORS[color]) + [1]
+            if shape == "cylinder":
+                spec.worldbody.add_geom(name=geom_name, type=mujoco.mjtGeom.mjGEOM_CYLINDER, pos=[x, y, 0.4],
+                                        size=[r, 0.4, 0], rgba=rgba)
             else:
-                spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, pos=[x, y, 0.4], size=[r, r, 0.4],
-                                        euler=[0, 0, self.rng.uniform(0, 90)], rgba=[0.3, 0.6, 0.85, 1])
+                spec.worldbody.add_geom(name=geom_name, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[x, y, 0.4],
+                                        size=[r, r, 0.4], euler=[0, 0, self.rng.uniform(0, 90)], rgba=rgba)
+            self.objects.append({"id": i, "color": color, "shape": shape, "x": x, "y": y, "r": r,
+                                 "geom_name": geom_name})
 
     def pose(self):
         x, y = self.data.xpos[self.base_id][:2]
@@ -115,8 +133,27 @@ class RobotWorld:
         out = []
         for a in SENSOR_ANGLES:
             d = self.data.sensor("range%d" % a).data[0]
-            out.append(1.0 if d < 0 or d > SENSOR_RANGE else d / SENSOR_RANGE)
+            out.append(1.0 if d < 0 or d > SENSOR_RANGE else float(d) / SENSOR_RANGE)
         return out
+
+    def visible(self):
+        """Objects the camera can see now: in the field of view, in range, nothing in the way."""
+        x, y, h = self.pose()
+        eye = np.array([x + 0.3 * math.cos(h), y + 0.3 * math.sin(h), 0.6])
+        geomid = np.array([-1], dtype=np.int32)
+        seen = []
+        for o in self.objects:
+            dx, dy = o["x"] - x, o["y"] - y
+            dist = math.hypot(dx, dy)
+            bearing = math.degrees(math.atan2(dy, dx) - h)
+            bearing = (bearing + 180) % 360 - 180
+            if dist > CAMERA_RANGE or abs(bearing) > CAMERA_FOV:
+                continue
+            vec = np.array([o["x"], o["y"], 0.4]) - eye
+            mujoco.mj_ray(self.model, self.data, eye, vec, None, 1, self.base_id, geomid)
+            if geomid[0] == o["geom"]:
+                seen.append(o)
+        return seen
 
     def step(self, left, right):
         """Wheel commands in -1..1 for one control period."""
