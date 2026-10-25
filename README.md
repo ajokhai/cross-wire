@@ -53,3 +53,9 @@ published `cross-talk` package.
 - While the brain runs, bytes from the Mac are data, so Ctrl-C does nothing. `deploy.py`
   sends the brain `!repl` first. Pressing the BOOT button also stops it.
 - `esp32/demo_animations.py` is the earlier starfield / bounce / Game of Life demo.
+
+## Benchmarks
+
+`bench/` holds the tests behind the Cross Talk benchmark write-up; raw results are in
+`bench/results/`. On 2026-10-25 the brain answered 600/600 steps over direct serial
+(median round trip 48.9 ms) and 883/900 through a Cross Talk hub (median 51.9 ms, p99 87.5 ms).
