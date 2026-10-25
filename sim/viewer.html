@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rover Sim</title>
+<style>
+  :root { --bg: #f6f6f3; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #d9d9d3;
+          --obstacle: #8a8a82; --robot: #1f6feb; --ray: rgba(31,111,235,.35); --ray-hit: #d73a49; --trail: rgba(31,111,235,.25); }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --panel: #1d1d1b; --ink: #ecece8; --muted: #9a9a93; --line: #34342f;
+            --obstacle: #5b5b55; --robot: #58a6ff; --ray: rgba(88,166,255,.35); --ray-hit: #ff7b72; --trail: rgba(88,166,255,.25); }
+  }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  canvas { width: 100%; height: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; display: block; }
+  .stats { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 12px 0; }
+  .stats div span { color: var(--muted); margin-right: 6px; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rover sim, brain on the ESP32</h1>
+  <canvas id="c" width="960" height="720"></canvas>
+  <div class="stats" id="stats"></div>
+  <button id="reset">New arena</button>
+</main>
+<script>
+const c = document.getElementById('c'), g = c.getContext('2d');
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+document.getElementById('reset').onclick = () => fetch('/reset', { method: 'POST' });
+
+function draw(s) {
+  const [W, H] = s.arena, k = c.width / W;
+  c.height = Math.round(H * k);
+  const X = x => x * k, Y = y => c.height - y * k;   // y up
+  g.clearRect(0, 0, c.width, c.height);
+
+  g.strokeStyle = css('--trail'); g.lineWidth = 3; g.beginPath();
+  s.trail.forEach(([x, y], i) => i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y))); g.stroke();
+
+  g.fillStyle = css('--obstacle');
+  for (const [x, y, r] of s.obstacles) { g.beginPath(); g.arc(X(x), Y(y), r * k, 0, 7); g.fill(); }
+
+  s.sensor_angles.forEach((a, i) => {
+    const ang = s.heading + a * Math.PI / 180, d = s.robot_r + s.sensors[i] * (s.sensor_range - s.robot_r);
+    g.strokeStyle = s.sensors[i] < 1 ? css('--ray-hit') : css('--ray'); g.lineWidth = 2;
+    g.beginPath(); g.moveTo(X(s.x), Y(s.y)); g.lineTo(X(s.x + Math.cos(ang) * d), Y(s.y + Math.sin(ang) * d)); g.stroke();
+  });
+
+  g.fillStyle = css('--robot');
+  g.beginPath(); g.arc(X(s.x), Y(s.y), s.robot_r * k, 0, 7); g.fill();
+  g.strokeStyle = css('--panel'); g.lineWidth = 3; g.beginPath(); g.moveTo(X(s.x), Y(s.y));
+  g.lineTo(X(s.x + Math.cos(s.heading) * s.robot_r), Y(s.y + Math.sin(s.heading) * s.robot_r)); g.stroke();
+
+  const item = (k, v) => `<div><span>${k}</span>${v}</div>`;
+  document.getElementById('stats').innerHTML =
+    item('Link', s.link) + item('Brain', s.brain_status || '–') + item('Step', s.steps) +
+    item('Answered', `${s.answered} (${s.missed} missed)`) + item('Round trip', `${s.latency_ms} ms`) +
+    item('Wheels', `L ${s.left.toFixed(2)}  R ${s.right.toFixed(2)}`) +
+    item('Driven', `${s.distance} m`) + item('Bumps', s.collisions) + item('Cells explored', s.coverage);
+}
+
+async function tick() {
+  try { draw(await (await fetch('/state')).json()); } catch (e) {}
+  setTimeout(tick, 100);
+}
+tick();
+</script>
+</body>
+</html>
